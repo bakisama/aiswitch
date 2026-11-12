@@ -58,7 +58,7 @@ def opts(args):
 
 def find(items, o):
     for it in items:
-        if it["svc"] == o.get("-s") and ("-a" not in o or it["acct"] == o["-a"]):
+        if it["svc"] == o.get("-s") and ("-a" not in o or (it["acct"] or "") == o["-a"]):
             return it
     return None
 
@@ -83,6 +83,12 @@ def run(args, out, err):
             err.write("password: " + (fmt(pw) if pw else "") + "\n")
         if "-w" in o:
             out.write((pw.decode() if printable(pw) else pw.hex()) + "\n")
+        return 0
+    if cmd == "dump-keychain":
+        for it in items:
+            acct = "<NULL>" if it["acct"] is None else fmt(it["acct"].encode())
+            out.write('keychain: "/Users/x/Library/Keychains/login.keychain-db"\nversion: 512\nclass: "genp"\n'
+                      f'attributes:\n    "acct"<blob>={acct}\n    "svce"<blob>="{it["svc"]}"\n')
         return 0
     if cmd == "add-generic-password":
         pw = bytes.fromhex(o["-X"]) if "-X" in o else o.get("-w", "").encode()

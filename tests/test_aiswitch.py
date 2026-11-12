@@ -424,6 +424,14 @@ class TestSecretServiceReal(StoreContract, unittest.TestCase):
         self.assertEqual(self.s.account(self.svc), "a2")
         self.assertEqual(self.s.read(self.svc)["meta"]["attrs"]["application"], "rust-keyring")
 
+    def test_item_without_account_keeps_its_attributes(self):
+        subprocess.run(["secret-tool", "store", "--label=t", "service", self.svc], input=b"s1", check=True)
+        item = self.s.read(self.svc)
+        self.s.replace(self.svc, item["account"], "s2", item["meta"])
+        r = subprocess.run(["secret-tool", "search", "--all", "service", self.svc], capture_output=True)
+        self.assertNotIn(b"username", r.stderr)
+        self.assertEqual(self.s.read(self.svc)["secret"], "s2")
+
     def test_vault_keeps_meta(self):
         v = A.SecretServiceStore(vault=True)
         meta = {"kind": "secret-service", "attrs": {"service": "x", "account": "y"}, "label": "L"}
@@ -468,7 +476,12 @@ class TestSecretServiceEndToEnd(Env):
                            capture_output=True)
         return r.stdout.decode() if r.returncode == 0 else None
 
+    def vault_services(self):
+        r = subprocess.run(["secret-tool", "search", "--all", "application", "aiswitch"], capture_output=True)
+        return {ln.split(" = ", 1)[1] for ln in r.stderr.decode().splitlines() if ln.startswith("attribute.service = ")}
+
     def test_switch(self):
+        before = self.vault_services()
         self.put("alice-token\nline2")
         self.run_cli("save", "tool", "alice")
         self.run_cli("new", "tool", "bob")
@@ -478,8 +491,9 @@ class TestSecretServiceEndToEnd(Env):
         self.run_cli("use", "tool", "alice")
         self.assertEqual(self.get(), "alice-token\nline2")     # same attributes: the tool finds it
         self.run_cli("rm", "tool", "bob", "-y")
-        r = subprocess.run(["secret-tool", "search", "--all", "application", "aiswitch"], capture_output=True)
-        self.assertEqual(r.stdout.count(b"\n[/"), len(self.all_refs()) - 1 if self.all_refs() else 0)
+        self.assertEqual(self.vault_services() - before, self.all_refs())   # no orphaned saved copies
+        self.run_cli("purge", "-y")
+        self.assertEqual(self.vault_services() - before, set())
 
 
 @unittest.skipUnless(REAL_STORE and sys.platform == "win32", "set AISWITCH_TEST_REAL_STORE=1 on Windows")
@@ -1299,3 +1313,208 @@ class TestGui(Env):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ------------------------------------------------- regressions from the adversarial review
+class TestReviewRegressions(Env):
+    def save_two_codex(self):
+        self.codex_login("a@x.com", "A1")
+        self.run_cli("save", "codex", "alice")
+        self.run_cli("new", "codex", "bob")
+        self.codex_login("b@x.com", "B1")
+        self.run_cli("save", "codex", "bob")
+
+    def test_R1_new_backup_survives_clock_going_back(self):
+        self.save_two_codex()
+        for i in range(5):
+            d = A.backup_root("codex") / f"2999010{i}-000000"     # "future" names (clock moved back)
+            d.mkdir(parents=True)
+            (d / "meta.json").write_text("{}")
+        live = self.codex_login("z@x.com", "Z9").read_bytes()
+        self.run_cli("use", "codex", "alice", "--force")
+        kept = [d for d in A.backup_dirs("codex") if (d / "auth").exists() and (d / "auth").read_bytes() == live]
+        self.assertTrue(kept, "the backup of the unsaved login was pruned")
+
+    def test_R1_missing_backup_is_a_rollback_failure(self):
+        with self.assertRaises(A.Fatal) as cm:
+            A.apply_or_rollback(A.load_platforms()["codex"], A.stores(), self.tmp / "gone",
+                                lambda: (_ for _ in ()).throw(OSError("boom")))
+        self.assertIn("ALSO failed", str(cm.exception))
+
+    def test_R2_mode_mismatch_is_refused(self):
+        os.environ["GEMINI_FORCE_ENCRYPTED_FILE_STORAGE"] = "true"
+        self.write(".gemini/google_accounts.json", '{"active": "alice@g"}')
+        self.kc.put("gemini-cli-oauth", "main-account", "kc-alice")
+        self.run_cli("save", "gemini", "alice")
+        self.kc.put("gemini-cli-oauth", "main-account", "kc-bob")
+        self.write(".gemini/google_accounts.json", '{"active": "bob@g"}')
+        self.run_cli("save", "gemini", "bob")
+        os.environ.pop("GEMINI_FORCE_ENCRYPTED_FILE_STORAGE")
+        _, _, err = self.run_cli("use", "gemini", "alice", ok=False)
+        self.assertIn("GEMINI_FORCE_ENCRYPTED_FILE_STORAGE", err)
+        self.assertEqual(self.kc.get("gemini-cli-oauth", "main-account"), "kc-bob")
+        meta = json.loads((A.snap_dir("gemini", "bob") / "meta.json").read_text())
+        self.assertTrue(meta["artifacts"]["keychain"]["present"])         # bob's snapshot intact
+
+    def test_R3_no_writeback_when_credentials_are_gone(self):
+        self.write(".claude/.credentials.json", "CRED-alice")
+        self.write(".claude.json", json.dumps({"oauthAccount": {"emailAddress": "a@x", "organizationUuid": "o"}}))
+        self.run_cli("save", "cc", "alice")
+        self.run_cli("new", "cc", "bob")
+        self.write(".claude/.credentials.json", "CRED-bob")
+        self.write(".claude.json", json.dumps({"oauthAccount": {"emailAddress": "b@x", "organizationUuid": "o"}}))
+        self.run_cli("save", "cc", "bob")
+        self.run_cli("use", "cc", "alice")
+        (self.home / ".claude/.credentials.json").unlink()                # creds gone, identity stays
+        _, out, _ = self.run_cli("use", "cc", "bob")
+        self.assertIn("not syncing back into 'alice'", out)
+        self.assertEqual((A.snap_dir("claude-code", "alice") / "credentials").read_bytes(), b"CRED-alice")
+
+    def test_R5_duplicate_identity_prefers_target(self):
+        self.codex_login("a@x.com", "A1", "v1-work")
+        self.run_cli("save", "codex", "work")
+        self.codex_login("a@x.com", "A1", "v1-work2")
+        self.run_cli("save", "codex", "work2", "--allow-duplicate")
+        refreshed = self.codex_login("a@x.com", "A1", "v2-work2").read_bytes()
+        st = A.load_state()
+        st["active"]["codex"] = "work"          # stale state must not win over the requested target
+        A.save_state(st)
+        _, out, _ = self.run_cli("use", "codex", "work2")
+        self.assertIn("already the active", out)
+        self.assertEqual(self.read(".codex/auth.json"), refreshed)
+        self.assertIn(b"v1-work", (A.snap_dir("codex", "work") / "auth").read_bytes())
+        self.assertNotIn(b"v2", (A.snap_dir("codex", "work") / "auth").read_bytes())
+
+    def test_PROC2_unknown_during_quit_wait_is_not_quit(self):
+        os.environ["AISWITCH_FORCE_OS"] = "linux"
+        plat = {"kind": "app", "label": "X", "processes": ["xapp"]}
+        seq = iter([[P(500, "/usr/bin/xapp", ["xapp"])]] + [None] * 100)
+        A.PROC_PROVIDER = lambda: next(seq)
+        A.proc_table(refresh=True)
+        self.assertFalse(A.wait_until_quit(plat, timeout=1.2))
+
+    def test_PROC3_bare_image_name_is_ambiguous(self):
+        os.environ["AISWITCH_FORCE_OS"] = "windows"
+        pt = A.ProcTable([P(4242, "claude.exe", ["claude.exe"])], partial=True)
+        self.assertEqual(A.running_state(A.load_platforms()["claude-code"], pt), ([], True))
+
+    def test_PROC4_unquittable_match_names_the_pids(self):
+        plat = {"kind": "app", "label": "X", "processes": ["xapp"], "process_match": ["--xapp-helper"]}
+        self.procs = [P(77, "/usr/bin/python3", ["python3", "-m", "x", "--xapp-helper"])]
+        with self.assertRaises(A.Fatal) as cm:
+            A.check_processes(plat, True)
+        self.assertIn("77", str(cm.exception))
+
+    def test_PROC1_ps_keeps_real_argv0(self):
+        outs = {"comm": " 10   %d sleep\n" % os.getuid() if POSIX else "", "args": " 10 claude 30\n"}
+        with mock.patch.object(A, "_run_quiet", lambda cmd, **k: outs["comm" if "comm=" in cmd else "args"]):
+            if POSIX:
+                procs = A._procs_ps()
+                self.assertEqual(procs[0].argv, ["claude", "30"])
+                self.assertTrue(A.ProcTable(procs).running("claude"))
+
+    def test_PROC6_windows_quoted_launch_and_bad_quotes(self):
+        os.environ["AISWITCH_FORCE_OS"] = "windows"
+        argv = A._launch_argv('"C:/Program Files/X/x.exe" --flag')
+        os.environ["AISWITCH_FORCE_OS"] = "linux"
+        self.assertEqual(argv[1:], ["--flag"])
+        self.assertTrue(argv[0].endswith("x.exe") and '"' not in argv[0])
+        self.assertFalse(A.launch_app({"label": "X", "launch": {A.host_os(): '"/opt/x y/app'}}))
+
+    def test_PROC8_gui_reports_unknown(self):
+        A.PROC_PROVIDER = lambda: None
+        A.ensure_root()
+        plats = {p["id"]: p for p in A.gui_state()}
+        self.assertIsNone(plats["claude-code"]["running"])
+
+
+@unittest.skipUnless(POSIX, "fake security is a posix script")
+class TestMacKeychainReviewFake(FakeSecurity, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.s = A.MacKeychain()
+
+    def db(self, items=None):
+        p = Path(os.environ["FAKE_SEC_DB"])
+        if items is not None:
+            p.write_text(json.dumps([{"svc": s, "acct": a, "pw": v.encode().hex()} for s, a, v in items]))
+        return [(i["svc"], i["acct"], bytes.fromhex(i["pw"]).decode()) for i in json.loads(p.read_text())]
+
+    def test_MK1_empty_account_is_not_any_account(self):
+        self.db([("S", "alice", "a")])
+        self.assertIsNone(self.s.read("S", ""))
+        self.assertFalse(self.s.delete("S", ""))
+        self.assertEqual(self.db(), [("S", "alice", "a")])
+        self.db([])
+        self.s.replace("S", "", "new")
+        self.assertEqual(self.db(), [("S", "", "new")])
+
+    def test_MK2_exclusive_replace_removes_every_other_account(self):
+        self.db([("S", "alice", "old"), ("S", "bob", "b"), ("T", "bob", "keep")])
+        self.s.replace("S", "alice", "new")
+        self.assertEqual(sorted(self.db()), [("S", "alice", "new"), ("T", "bob", "keep")])
+
+
+class TestBrowserReview(Env):
+    def setUp(self):
+        super().setUp()
+        (self.tmp / "bin").mkdir(exist_ok=True)
+        os.environ["PATH"] = str(self.tmp / "bin")
+
+    def cfg(self, plat):
+        self.store().mkdir(exist_ok=True)
+        (self.store() / "platforms.json").write_text(json.dumps({"schema": 1, "platforms": {"claude-web": plat}}))
+
+    def local_state(self, rel, profiles):
+        self.write(rel + "/Local State", json.dumps(
+            {"profile": {"info_cache": {d: {"name": n} for d, n in profiles.items()}}}))
+
+    @unittest.skipUnless(POSIX, "sh scripts")
+    def test_BR1_legacy_app_name_maps_to_preset(self):
+        self.fake_bin("google-chrome")
+        self.cfg({"browser": "Google Chrome", "user_data": "{xdg_config}/google-chrome"})
+        b = A.select_browser(A.load_platforms()["claude-web"])
+        self.assertEqual((b.preset, bool(b.launcher)), ("chrome", True))
+
+    @unittest.skipUnless(POSIX, "sh scripts")
+    def test_BR2_preset_with_user_data(self):
+        self.fake_bin("microsoft-edge")
+        self.cfg({"browser": "edge", "user_data": "~/edge-data"})
+        b = A.select_browser(A.load_platforms()["claude-web"])
+        self.assertEqual((b.label, b.data, b.pass_user_data), ("Microsoft Edge", self.home / "edge-data", True))
+        self.assertTrue(b.launcher)
+
+    def test_BR3_saved_browser_must_still_match(self):
+        self.local_state(".config/google-chrome", {"Profile 1": "Work"})
+        self.run_cli("save", "claude-web", "work", "--profile", "Work")
+        self.cfg({"browser": "edge"})
+        _, _, err = self.run_cli("use", "claude-web", "work", ok=False)
+        self.assertIn("saved with Google Chrome", err)
+
+    @unittest.skipUnless(POSIX, "sh scripts")
+    def test_BR4_browser_bin_only_keeps_preset_data(self):
+        exe = self.fake_bin("my-chrome")
+        self.cfg({"browser": "chrome", "browser_bin": str(exe)})
+        b = A.select_browser(A.load_platforms()["claude-web"])
+        self.assertEqual((b.launcher, b.data), ([str(exe)], self.home / ".config/google-chrome"))
+        self.cfg({"browser_bin": str(exe)})
+        self.assertEqual(A.select_browser(A.load_platforms()["claude-web"]).launcher, [str(exe)])
+
+    @unittest.skipUnless(POSIX, "sh scripts")
+    def test_BR5_wsl_windows_browser_gets_windows_path(self):
+        log = self.tmp / "args"
+        exe = self.fake_bin("vivaldi.exe", f'#!/bin/sh\necho "$@" > {log}\n')
+        self.fake_bin("wslpath", '#!/bin/sh\necho "C:\\\\Users\\\\me\\\\Vivaldi"\n')
+        self.local_state("viv", {"Default": "Me"})
+        self.cfg({"browser": "Vivaldi", "user_data": "~/viv", "browser_bin": str(exe)})
+        with mock.patch.object(A, "is_wsl", lambda: True):
+            b = A.select_browser(A.load_platforms()["claude-web"])
+            self.assertIsNone(A.open_browser_profile(b, "Default", "https://x"))
+        time.sleep(0.3)
+        self.assertIn("--user-data-dir=C:\\Users\\me\\Vivaldi", log.read_text())
+
+    @unittest.skipUnless(POSIX, "sh scripts")
+    def test_WSL_cmd_output_in_oem_codepage_does_not_crash(self):
+        self.fake_bin("cmd.exe", "#!/bin/sh\nprintf 'C:\\\\Users\\\\Jos\\202\\\\AppData\\\\Local\\r\\n'\n")
+        A._WSL_WIN = None
+        self.assertEqual(A._wsl_windows_dirs(), {})

@@ -306,10 +306,13 @@ def sandbox_kind():
 
 
 def is_store_python():
-    """Microsoft Store Python virtualises writes under %APPDATA%/%LOCALAPPDATA%."""
+    """Microsoft Store Python virtualises writes under %APPDATA%/%LOCALAPPDATA% - also when
+    running from a venv created from it (the base interpreter is still the packaged one)."""
     if sys.platform != "win32":
         return False
-    probe = " ".join([sys.executable, os.path.realpath(sys.executable), sys.prefix])
+    probe = " ".join([sys.executable, os.path.realpath(sys.executable), sys.prefix,
+                      getattr(sys, "base_prefix", ""), getattr(sys, "base_exec_prefix", ""),
+                      getattr(sys, "_base_executable", "") or ""])
     return "WindowsApps" in probe or "PythonSoftwareFoundation.Python" in probe
 
 
@@ -802,7 +805,8 @@ def _procs_linux():
 def _procs_ps():
     """BSD/macOS/busybox ps. -ww and no COLUMNS so long command lines are not truncated; stdin
     detached so BSD ps can't take the width from the terminal. comm is the full executable path
-    on macOS (it may contain spaces, so it is the last column and never split)."""
+    on macOS (it may contain spaces, so it is the last column and never split); argv[0] comes
+    from args (it can differ from the executable: process.title, symlinks, exec -a)."""
     uid = str(os.getuid())
     env = {k: v for k, v in os.environ.items() if k != "COLUMNS"}
     env["LC_ALL"] = "C"
@@ -831,14 +835,27 @@ def _procs_ps():
         pid, exe = int(parts[0]), parts[2]
         if pid == os.getpid():
             continue
-        cmdline = argmap.get(pid, exe)
-        rest = cmdline[len(exe):] if cmdline.startswith(exe) else " ".join(cmdline.split()[1:])
-        out.append(Proc(pid, exe, [exe] + rest.split(), cmdline))
+        cmdline = argmap.get(pid) or exe
+        if cmdline.startswith(exe):            # macOS: argv[0] is the (space-containing) exec path
+            argv = [exe] + cmdline[len(exe):].split()
+        else:
+            argv = cmdline.split() or [exe]
+        out.append(Proc(pid, exe, argv, cmdline))
     return out
 
 
 def _win_tool(*rel):
     return os.path.join(os.environ.get("SystemRoot") or r"C:\Windows", "System32", *rel)
+
+
+def _pwsh():
+    """PowerShell 7 from its absolute install location only (never the cwd / relative PATH)."""
+    for base in (os.environ.get("ProgramW6432"), os.environ.get("ProgramFiles")):
+        if base:
+            p = os.path.join(base, "PowerShell", "7", "pwsh.exe")
+            if os.path.isfile(p):
+                return p
+    return None
 
 
 def _procs_windows():
@@ -860,21 +877,22 @@ def _procs_windows():
         mine = parse(_run_quiet([tasklist, "/FO", "CSV", "/NH"]))
         if me not in mine:
             return None, False
-    script = ("[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-CimInstance Win32_Process | "
-              "Select-Object ProcessId,ExecutablePath,CommandLine | ConvertTo-Json -Compress")
+    script = ("[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false; "
+              "Get-CimInstance Win32_Process | Select-Object ProcessId,ExecutablePath,CommandLine | "
+              "ConvertTo-Json -Compress")
     cmdlines, ok = {}, False
-    for shell in (_win_tool("WindowsPowerShell", "v1.0", "powershell.exe"), shutil.which("pwsh")):
+    for shell in (_win_tool("WindowsPowerShell", "v1.0", "powershell.exe"), _pwsh()):
         if not shell or not os.path.exists(shell):
             continue
         ps = _run_quiet([shell, "-NoProfile", "-NonInteractive", "-Command", script], timeout=25)
         try:
-            data = json.loads(ps) if ps else None
+            data = json.loads(ps.lstrip("﻿")) if ps else None
         except ValueError:
             data = None
         if data is None:
             continue
         for p in data if isinstance(data, list) else [data]:
-            with contextlib.suppress(TypeError, ValueError, KeyError):
+            with contextlib.suppress(TypeError, ValueError, KeyError, AttributeError):
                 cmdlines[int(p["ProcessId"])] = (p.get("ExecutablePath") or "", p.get("CommandLine") or "")
         ok = True
         break
@@ -897,19 +915,29 @@ class ProcTable:
                                                  for p in procs]
         self.partial = partial         # True: processes outside our view exist (sandbox, no cmdlines)
 
+    @staticmethod
+    def _has_path(p):
+        return any(sep in (p.exe or "") or sep in (p.argv[0] if p.argv else "") for sep in ("/", "\\"))
+
     def _hit(self, p, names, paths, match, exclude):
         exe, argv0 = _npath(p.exe), _npath(p.argv[0] if p.argv else "")
         if any(_npath(x) in exe or _npath(x) in argv0 for x in exclude):
             return None
+        hit = None
         for cand in {_norm(_base(p.exe)), _norm(_base(p.argv[0] if p.argv else ""))} - {""}:
             for n in names:
                 n = _norm(n)
                 if cand == n or re.fullmatch(re.escape(n) + ARCH_SUFFIX_RE, cand):
-                    return "strong"
-            if cand in INTERPRETERS:
+                    hit = "strong"
+            if not hit and cand in INTERPRETERS:
                 script = next((a for a in p.argv[1:] if not a.startswith("-")), "")
                 if script and _norm(_base(script)) in {_norm(n) for n in names}:
-                    return "strong"
+                    hit = "strong"
+        if hit and exclude and not self._has_path(p):
+            # e.g. a bare "claude.exe" image name: the desktop-app path excludes can't be checked
+            return "ambiguous"
+        if hit:
+            return hit
         if any(_npath(x) in exe or _npath(x) in argv0 for x in paths):
             return "strong"
         if match and any(_npath(x) in _npath(p.cmdline) for x in match):
@@ -917,7 +945,7 @@ class ProcTable:
         return None
 
     def find(self, names=(), paths=(), match=(), exclude=()):
-        """[(pid, 'strong'|'weak', argv)] or None when detection is unavailable."""
+        """[(pid, 'strong'|'weak'|'ambiguous', argv)] or None when detection is unavailable."""
         if self.procs is None:
             return None
         out = []
@@ -929,13 +957,15 @@ class ProcTable:
 
     def matches(self, name, patterns=()):
         hits = self.find([name], (), patterns)
-        return None if hits is None else [h[0] for h in hits]
+        return None if hits is None else [h[0] for h in hits if h[1] != "ambiguous"]
 
     def running(self, name, patterns=()):
-        m = self.matches(name, patterns)
-        if m is None:
+        hits = self.find([name], (), patterns)
+        if hits is None:
             return None
-        return True if m else (None if self.partial else False)
+        if any(h[1] != "ambiguous" for h in hits):
+            return True
+        return None if (self.partial or hits) else False
 
 
 def proc_table(refresh=False, max_age=None):
@@ -981,10 +1011,15 @@ def running_state(pcfg, pt=None):
     hits = pt.find(**spec)
     if hits is None:
         return [], bool(spec["names"] or spec["paths"])
-    if hits:
+    if any(h[1] != "ambiguous" for h in hits):
         label = (spec["names"] or [pcfg.get("app") or pcfg["label"]])[0]
         return [label], False
-    return [], pt.partial and bool(spec["names"] or spec["paths"])
+    return [], bool(hits) or (pt.partial and bool(spec["names"] or spec["paths"]))
+
+
+def running_pids(pcfg, pt=None):
+    pt = pt or proc_table()
+    return [h[0] for h in (pt.find(**proc_spec(pcfg)) or []) if h[1] != "ambiguous"]
 
 
 def _quit_targets(pcfg):
@@ -1032,10 +1067,13 @@ def quit_app(pcfg):
 
 
 def wait_until_quit(pcfg, timeout=15.0):
+    """True once the app is definitely gone. 'Unknown' (detection failed on a poll) is never
+    taken as 'quit'."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         time.sleep(0.5)
-        if not running_state(pcfg, proc_table(refresh=True))[0]:
+        names, unknown = running_state(pcfg, proc_table(refresh=True))
+        if not names and not unknown:
             return True
     return False
 
@@ -1044,7 +1082,10 @@ def _launch_argv(cmd):
     """Only the executable (and args that look like paths/tokens) are template-expanded; URLs
     and flags pass through untouched."""
     if isinstance(cmd, str):
-        cmd = shlex.split(cmd, posix=os.name != "nt")
+        if host_os() == "windows":
+            cmd = [a[1:-1] if len(a) > 1 and a[0] == a[-1] == '"' else a for a in shlex.split(cmd, posix=False)]
+        else:
+            cmd = shlex.split(cmd)
     out = []
     for i, a in enumerate(cmd):
         if i == 0 or a.startswith("~") or _TOKEN_RE.search(a):
@@ -1078,7 +1119,7 @@ def launch_app(pcfg):
             return True
         _spawn_detached(argv)
         return True
-    except (OSError, Fatal) as e:
+    except (OSError, ValueError, Fatal) as e:
         warn(f"could not launch {pcfg['label']}: {e}")
         return False
 
@@ -1284,7 +1325,9 @@ class MacKeychain(SecretStore):
     indistinguishable from a hex secret). Secrets are written through `security -i` on stdin,
     hex encoded, so they never appear in a process argv visible to `ps`. `security -i` reads
     commands into a 4096-byte buffer and silently splits longer lines, so longer secrets are
-    never sent that way: they use argv (with a warning) unless AISWITCH_NO_ARGV_SECRETS=1."""
+    never sent that way: they use argv (with a warning) unless AISWITCH_NO_ARGV_SECRETS=1.
+    Accounts: None = unspecified (any item of the service); "" = the item whose account is
+    empty/<NULL>; both are kept distinct (-a "" is passed for "")."""
     name = "macos-keychain"
     NOT_FOUND = 44
     SECURITY = "/usr/bin/security"
@@ -1307,14 +1350,18 @@ class MacKeychain(SecretStore):
     def _txt(b):
         return (b or b"").decode("utf-8", "replace")
 
+    @staticmethod
+    def _a(account):
+        return ["-a", account] if account is not None else []
+
     def _fail(self, what, service, r):
         die(f"keychain {what} for '{service}' failed (security exit {r.returncode}: "
             f"{self._txt(r.stderr).strip() or 'no message'}). The keychain may be locked, access was "
             "denied, or there is no GUI session (SSH).", "keychain")
 
     @staticmethod
-    def _parse_acct(out):
-        m = re.search(r'^\s*"acct"<blob>=(.*)$', out, re.M)
+    def _parse_attr(out, attr):
+        m = re.search(r'^\s*"' + re.escape(attr) + r'"<blob>=(.*)$', out, re.M)
         if not m:
             return None
         v = m.group(1).strip()
@@ -1325,6 +1372,10 @@ class MacKeychain(SecretStore):
             return bytes.fromhex(h.group(1)).decode("utf-8", "surrogateescape")
         q = re.match(r'^"(.*)"$', v)
         return q.group(1) if q else None
+
+    @classmethod
+    def _parse_acct(cls, out):
+        return cls._parse_attr(out, "acct")
 
     @staticmethod
     def _parse_pw(err):
@@ -1344,8 +1395,7 @@ class MacKeychain(SecretStore):
         return q.group(1) if q else None
 
     def _find(self, service, account, with_pw):
-        args = ["find-generic-password", "-s", service] + (["-a", account] if account else [])
-        r = self._sec(args + (["-g"] if with_pw else []))
+        r = self._sec(["find-generic-password", "-s", service] + self._a(account) + (["-g"] if with_pw else []))
         if r.returncode == self.NOT_FOUND:
             return None
         if r.returncode != 0:
@@ -1375,6 +1425,20 @@ class MacKeychain(SecretStore):
         got = self._find(service, account, True)
         return None if got is None else got[1]
 
+    def accounts(self, service):
+        """Accounts of every generic-password item of `service`, from an attribute-only
+        `dump-keychain` (no -d: no passwords read, no prompts). None if unavailable."""
+        r = self._sec(["dump-keychain"])
+        if r.returncode != 0:
+            return None
+        out = []
+        for block in re.split(r'(?m)^keychain: ', self._txt(r.stdout)):
+            if 'class: "genp"' in block and self._parse_attr(block, "svce") == service:
+                a = self._parse_attr(block, "acct")
+                if a is not None:
+                    out.append(a)
+        return out
+
     @staticmethod
     def _q(s):
         if s is None or any(ch in s for ch in '"\\\n\r'):
@@ -1382,40 +1446,63 @@ class MacKeychain(SecretStore):
         return f'"{s}"'
 
     def write(self, service, account, secret, meta=None):
-        account = account or ""
-        qs, qa = self._q(service), self._q(account)
+        if account is None:                      # update whichever item exists, keeping its account
+            account = self.account(service)
+        qs, qa = self._q(service), self._q(account) if account is not None else ""
         line = None
-        if qs and qa:
-            line = (f"add-generic-password -U -s {qs}" + (f" -a {qa}" if account else "")
+        if qs and qa is not None:
+            line = (f"add-generic-password -U -s {qs}" + (f" -a {qa}" if account is not None else "")
                     + f" -X {secret.encode('utf-8').hex()}\n")
         if line and len(line.encode("utf-8")) < self.LINE_MAX:
             r = self._sec(["-i"], line)
             if self._secret_of(service, account) == secret:
                 return
-            why = self._txt(r.stderr).strip() or "the stdin write did not verify"
+            err = self._txt(r.stderr).strip()
+            if err:
+                # `security` reported a real error (ACL denial, bad keychain): retrying the same
+                # write with the secret on argv would only expose it.
+                die(f"keychain write for '{service}' failed ({err})", "keychain")
+            why = "the stdin write did not verify"
         elif line:
             why = f"the secret ({len(secret)} bytes) is too long for `security -i`"
         else:
             why = "the service/account name contains a quote, backslash or newline"
         if os.environ.get("AISWITCH_NO_ARGV_SECRETS"):
             die(f"keychain write for '{service}' cannot go through stdin ({why}) and "
-                "AISWITCH_NO_ARGV_SECRETS is set; nothing larger was written.", "keychain")
+                "AISWITCH_NO_ARGV_SECRETS is set; nothing was written.", "keychain")
         self.used_argv_fallback = True
         warn_once("kc-argv", f"{why}; passing the secret on the `security` command line instead "
                              "(briefly visible to other processes of your user via `ps`)")
-        r = self._sec(["add-generic-password", "-U", "-s", service]
-                      + (["-a", account] if account else []) + ["-w", secret])
+        r = self._sec(["add-generic-password", "-U", "-s", service] + self._a(account) + ["-w", secret])
         if r.returncode != 0:
             self._fail("write", service, r)
         if self._secret_of(service, account) != secret:
             die(f"keychain write for '{service}' did not verify", "keychain")
 
-    def _other_account(self, service, account):
-        a = self.account(service)
-        return a if a is not None and a != (account or "") else None
+    def replace(self, service, account, secret, meta=None, exclusive=True):
+        if account is None:
+            account = self.account(service)
+        self.write(service, account, secret)                 # write first ...
+        if not exclusive:
+            return
+        mine = account if account is not None else ""
+        others = self.accounts(service)
+        if others is None:                                   # no dump: peel off first-found items
+            for _ in range(20):
+                a = self.account(service)
+                if a is None or a == mine:
+                    break
+                self.delete(service, a)
+            return
+        for a in others:                                     # ... delete the other accounts after
+            if a != mine:
+                self.delete(service, a)
+        left = [a for a in (self.accounts(service) or []) if a != mine]
+        if left:
+            warn(f"could not remove other keychain items of '{service}' (accounts: {', '.join(left)})")
 
     def delete(self, service, account=None):
-        r = self._sec(["delete-generic-password", "-s", service] + (["-a", account] if account else []))
+        r = self._sec(["delete-generic-password", "-s", service] + self._a(account))
         if r.returncode == self.NOT_FOUND:
             return False
         if r.returncode != 0:
@@ -1427,8 +1514,9 @@ class SecretServiceStore(SecretStore):
     """freedesktop Secret Service (GNOME Keyring, KWallet, KeePassXC, ...) via `secret-tool`
     (libsecret-tools). `service` is the item's "service" attribute; the account is its
     "username" (keyring-rs, Python keyring) or "account" (keytar) attribute. Secrets travel on
-    stdin/stdout only. `lookup` exits 1 silently both for "no match" and for a dismissed unlock
-    prompt, so existence is decided by `search --all` (which lists locked items too).
+    stdin/stdout only. `lookup` and `clear` exit 1 silently both for "no match" and for a locked
+    item whose unlock prompt was dismissed, so existence and removal are always confirmed with
+    `search --all` (which lists locked items too).
     Note: keyring-rs "persistent" clients (e.g. Codex on Linux) also cache secrets in the
     kernel keyutils keyring, so swapping only the Secret Service item does not reach them."""
     name = "secret-service"
@@ -1547,9 +1635,8 @@ class SecretServiceStore(SecretStore):
         return out
 
     def _target(self, service, account, meta):
-        account = account or ""
         if self.vault:
-            attrs = {"service": service, "username": account, "application": "aiswitch"}
+            attrs = {"service": service, "username": account or "", "application": "aiswitch"}
             if meta:
                 attrs[self.META_ATTR] = json.dumps(meta, separators=(",", ":"), sort_keys=True)
             return attrs, f"aiswitch saved copy ({service})"
@@ -1559,8 +1646,12 @@ class SecretServiceStore(SecretStore):
             prior = self._find(service, account)
             if prior:
                 attrs, label = dict(prior[0]), label or prior[1]
-        attrs.update({"service": service, self._acct(attrs)[0]: account})
-        return attrs, label or f"{service} ({account})"
+        attrs["service"] = service
+        # Only set an account attribute the item already has (or a non-empty account): an item
+        # created without one must be recreated without one.
+        if any(k in attrs for k in self.ACCT_KEYS) or account:
+            attrs[self._acct(attrs)[0]] = account or ""
+        return attrs, label or (f"{service} ({account})" if account else service)
 
     def _store(self, service, attrs, label, secret):
         data = secret.encode("utf-8")
@@ -1577,8 +1668,10 @@ class SecretServiceStore(SecretStore):
     def _clear(self, service, attrs):
         r = self._run(["clear", *self._pairs(attrs)])
         err = r.stderr.decode("utf-8", "replace").strip()
-        if r.returncode != 0 and err:  # exit 1 + silence = nothing matched
+        if r.returncode != 0 and err:
             self._fail("delete", service, err)
+        if self._search(attrs)[0]:    # exit 1 + silence also means "locked, prompt dismissed"
+            self._fail("delete", service, "the item is still there (locked keyring?)")
 
     def write(self, service, account, secret, meta=None):
         attrs, label = self._target(service, account, meta)
@@ -1602,9 +1695,6 @@ class SecretServiceStore(SecretStore):
         if got is None:
             return False
         self._clear(service, got[0])
-        if self._search(got[0])[0]:
-            die(f"secret service item '{service}' is still present after delete (locked keyring?)",
-                "keychain")
         return True
 
 
@@ -1645,15 +1735,18 @@ def _wincred():
         adv.CredDeleteW.restype = wintypes.BOOL
         adv.CredFree.argtypes = [ctypes.c_void_p]
         adv.CredFree.restype = None
-        _WINCRED = (ctypes, wintypes, CREDENTIALW, PCRED, adv)
+        _WINCRED = collections.namedtuple("WinCred", "ct wt CRED ATTR PCRED adv")(
+            ctypes, wintypes, CREDENTIALW, CREDENTIAL_ATTRIBUTEW, PCRED, adv)
     return _WINCRED
 
 
 class WinCredStore(SecretStore):
     """Windows Credential Manager, CRED_TYPE_GENERIC. `service` is the exact TargetName shown by
     `cmdkey /list` (keyring-rs: "<user>.<service>"; keytar: "<service>/<account>"; Python keyring:
-    "<service>"); the account is UserName. Blob bytes round-trip exactly (meta records the
-    encoding: UTF-16LE for keyring-rs / Python keyring, UTF-8 for keytar)."""
+    "<service>"); the account is UserName. Target names are unique, so an account-scoped
+    artifact only ever sees a credential whose UserName matches. Blob bytes, flags and
+    application attributes round-trip exactly (meta records the blob encoding: UTF-16LE for
+    keyring-rs / Python keyring, UTF-8 for keytar)."""
     name = "windows-credential-manager"
     TYPE_GENERIC = 1
     PERSIST_LOCAL_MACHINE = 2
@@ -1668,14 +1761,15 @@ class WinCredStore(SecretStore):
         self.default_enc = default_enc
 
     def _fail(self, what, service, err):
-        ct = _wincred()[0]
+        ct = _wincred().ct
         msg = self.HINTS.get(err) or ct.FormatError(err).strip()
         die(f"Credential Manager {what} for '{service}' failed (Windows error {err}: {msg}).", "keychain")
 
     def _get(self, service):
-        ct, _, _, PCRED, adv = _wincred()
-        p = PCRED()
-        if not adv.CredReadW(service, self.TYPE_GENERIC, 0, ct.byref(p)):
+        w = _wincred()
+        ct = w.ct
+        p = w.PCRED()
+        if not w.adv.CredReadW(service, self.TYPE_GENERIC, 0, ct.byref(p)):
             err = ct.get_last_error()
             if err == self.ERROR_NOT_FOUND:
                 return None
@@ -1684,10 +1778,16 @@ class WinCredStore(SecretStore):
             cr = p.contents
             n = cr.CredentialBlobSize
             blob = ct.string_at(cr.CredentialBlob, n) if n and cr.CredentialBlob else b""
+            attrs = []
+            for i in range(cr.AttributeCount):
+                a = cr.Attributes[i]
+                val = ct.string_at(a.Value, a.ValueSize) if a.ValueSize and a.Value else b""
+                attrs.append({"keyword": a.Keyword or "", "flags": a.Flags,
+                              "value": base64.b64encode(val).decode("ascii")})
             return {"account": cr.UserName or "", "blob": blob, "persist": cr.Persist,
-                    "comment": cr.Comment, "alias": cr.TargetAlias}
+                    "comment": cr.Comment, "alias": cr.TargetAlias, "flags": cr.Flags, "attrs": attrs}
         finally:
-            adv.CredFree(ct.cast(p, ct.c_void_p))
+            w.adv.CredFree(ct.cast(p, ct.c_void_p))
 
     @staticmethod
     def _decode(blob):
@@ -1703,55 +1803,95 @@ class WinCredStore(SecretStore):
     def _encode(secret, enc):
         return base64.b64decode(secret) if enc == "base64" else secret.encode(enc)
 
-    def account(self, service, account=None):
+    def _mine(self, service, account):
         it = self._get(service)
+        if it is None or (account is not None and it["account"] != account):
+            return None
+        return it
+
+    def account(self, service, account=None):
+        it = self._mine(service, account)
         return None if it is None else it["account"]
 
     def read(self, service, account=None):
-        it = self._get(service)
+        it = self._mine(service, account)
         if it is None:
             return None
         secret, enc = self._decode(it["blob"])
         return {"account": it["account"], "secret": secret,
-                "meta": {"kind": self.name, "enc": enc, "persist": it["persist"],
-                         "comment": it["comment"], "alias": it["alias"]}}
+                "meta": {"kind": self.name, "enc": enc, "persist": it["persist"], "comment": it["comment"],
+                         "alias": it["alias"], "flags": it["flags"], "attrs": it["attrs"]}}
+
+    def _meta_of(self, it):
+        return {"enc": self._decode(it["blob"])[1], "persist": it["persist"], "comment": it["comment"],
+                "alias": it["alias"], "flags": it["flags"], "attrs": it["attrs"]}
 
     def write(self, service, account, secret, meta=None):
-        ct, _, CRED, _, adv = _wincred()
+        w = _wincred()
+        ct = w.ct
         m = meta if isinstance(meta, dict) and meta.get("kind") == self.name else {}
-        if not m:
-            prior = self._get(service)
-            if prior:
-                m = {"enc": self._decode(prior["blob"])[1], "persist": prior["persist"],
-                     "comment": prior["comment"], "alias": prior["alias"]}
+        prior = self._get(service)
+        if not m and prior:
+            m = self._meta_of(prior)
+        if account is None:
+            account = prior["account"] if prior else ""
         blob = self._encode(secret, m.get("enc") or self.default_enc)
         if len(blob) > self.max_secret:
             die(f"secret for '{service}' is {len(blob)} bytes; Windows Credential Manager holds at "
                 f"most {self.max_secret}. Nothing was changed.", "keychain")
-        cr = CRED()
+        cr = w.CRED()
         cr.Type = self.TYPE_GENERIC
+        cr.Flags = int(m.get("flags") or 0)
         cr.TargetName = service
         cr.UserName = account or None
         cr.Comment = m.get("comment")
         cr.TargetAlias = m.get("alias") or None
         cr.Persist = int(m.get("persist") or self.PERSIST_LOCAL_MACHINE)
         cr.CredentialBlobSize = len(blob)
-        buf = None
+        keep = []                                    # buffers must outlive CredWriteW
         if blob:
             buf = (ct.c_ubyte * len(blob)).from_buffer_copy(blob)
+            keep.append(buf)
             cr.CredentialBlob = ct.cast(buf, ct.POINTER(ct.c_ubyte))
-        if not adv.CredWriteW(ct.byref(cr), 0):
+        attrs = m.get("attrs") or []
+        if attrs:
+            arr = (w.ATTR * len(attrs))()
+            for i, a in enumerate(attrs):
+                val = base64.b64decode(a.get("value") or "")
+                arr[i].Keyword = a.get("keyword") or ""
+                arr[i].Flags = int(a.get("flags") or 0)
+                arr[i].ValueSize = len(val)
+                if val:
+                    vb = (ct.c_ubyte * len(val)).from_buffer_copy(val)
+                    keep.append(vb)
+                    arr[i].Value = ct.cast(vb, ct.POINTER(ct.c_ubyte))
+            keep.append(arr)
+            cr.AttributeCount = len(attrs)
+            cr.Attributes = ct.cast(arr, ct.POINTER(w.ATTR))
+        if not w.adv.CredWriteW(ct.byref(cr), 0):
             self._fail("write", service, ct.get_last_error())
-        del buf
+        del keep
         got = self._get(service)
         if not got or got["blob"] != blob or got["account"] != (account or ""):
             die(f"Credential Manager write for '{service}' did not verify", "keychain")
 
+    def replace(self, service, account, secret, meta=None, exclusive=True):
+        # Target names are unique: exclusive replace is a plain overwrite. A scoped artifact must
+        # never take over a credential that belongs to another account.
+        if not exclusive and account is not None:
+            it = self._get(service)
+            if it is not None and it["account"] != account:
+                die(f"Credential Manager target '{service}' belongs to account '{it['account']}', not "
+                    f"'{account}'; refusing to overwrite it.", "keychain")
+        self.write(service, account, secret, meta)
+
     def delete(self, service, account=None):
-        ct, _, _, _, adv = _wincred()
-        if adv.CredDeleteW(service, self.TYPE_GENERIC, 0):
+        w = _wincred()
+        if account is not None and self._mine(service, account) is None:
+            return False
+        if w.adv.CredDeleteW(service, self.TYPE_GENERIC, 0):
             return True
-        err = ct.get_last_error()
+        err = w.ct.get_last_error()
         if err == self.ERROR_NOT_FOUND:
             return False
         self._fail("delete", service, err)
@@ -2178,7 +2318,8 @@ def purge_dir(d, st, quiet=False):
 
 def sweep_live_leftovers(pcfg):
     """Finish live-side operations interrupted by a crash / SIGKILL / power loss: a dir artifact
-    renamed away but not yet replaced is moved back; stale temp copies are removed."""
+    renamed away for replacement but not yet replaced (".aiswitch-old-") is moved back; dirs being
+    deleted (".aiswitch-del-") or staged (".aiswitch-new-") and stale temp files are removed."""
     for spec in artifacts(pcfg):
         if spec["type"] == "keychain":
             continue
@@ -2191,13 +2332,13 @@ def sweep_live_leftovers(pcfg):
             names = os.listdir(parent)
         except OSError:
             continue
-        pat = re.compile(r"\." + re.escape(p.name) + r"\.aiswitch-(old|new)-[0-9a-f]{8}")
+        pat = re.compile(r"\." + re.escape(p.name) + r"\.aiswitch-(old|new|del)-[0-9a-f]{8}")
         hits = [(n, m.group(1)) for n in names if (m := pat.fullmatch(n))]
         olds = sorted((n for n, kind in hits if kind == "old"), key=lambda n: os.lstat(parent / n).st_mtime)
         if olds and not os.path.lexists(p):
             replace_file(parent / olds.pop(), p)       # crash between "rename away" and "rename in"
             warn(f"restored {p} from an interrupted switch")
-        for n in olds + [n for n, kind in hits if kind == "new"]:
+        for n in olds + [n for n, kind in hits if kind in ("new", "del")]:
             rmtree_force(parent / n)
         for n in names:
             if re.fullmatch(r"\.aiswitch-[A-Za-z0-9_]{8}", n) and os.path.isfile(parent / n):
@@ -2278,8 +2419,9 @@ def restore(spec, src, ent, st):
                 raise
             rmtree_force(old)
         elif os.path.lexists(p):
-            replace_file(p, old)
-            rmtree_force(old)
+            gone = p.parent / f".{p.name}.aiswitch-del-{secrets.token_hex(4)}"   # never restored by the sweep
+            replace_file(p, gone)
+            rmtree_force(gone)
     elif t == "json_keys":
         p = spec_path(spec)
         live = read_json(p)
@@ -2416,10 +2558,36 @@ def write_meta_dir(final, meta, st):
     swap_in(tmp, final, st)
 
 
+PREDICATE_HINTS = {
+    "codex_keyring": 'cli_auth_credentials_store = "keyring" or "auto" in Codex\'s config.toml',
+    "gemini_encrypted": "GEMINI_FORCE_ENCRYPTED_FILE_STORAGE=true",
+    "gemini_keychain": "GEMINI_FORCE_ENCRYPTED_FILE_STORAGE=true (without GEMINI_FORCE_FILE_STORAGE, outside WSL)",
+}
+
+
+def check_mode(pcfg, meta, what):
+    """Refuse when a snapshot holds credentials (present artifacts) that the current settings
+    don't manage (an enabled_if predicate is false now): switching would leave the other
+    account's credentials live, and syncing would drop and purge the saved ones."""
+    enabled = {a["name"] for a in artifacts(pcfg)}
+    recorded = (meta or {}).get("artifacts") or {}
+    me = host_os()
+    bad = [a for a in pcfg.get("artifacts", [])
+           if a.get("enabled_if") and me in a.get("os", [me]) and a["name"] not in enabled
+           and isinstance(recorded.get(a["name"]), dict) and recorded[a["name"]].get("present")]
+    if bad:
+        why = "; ".join(f"'{a['name']}' (saved while {PREDICATE_HINTS.get(a['enabled_if'], a['enabled_if'])})"
+                        for a in bad)
+        die(f"{what} was saved with credentials that the current settings don't manage: {why}. "
+            "Switching now would leave another account's credentials live. Use the same setting "
+            "as when it was saved, or re-save the account under the new setting.", "mode")
+
+
 def restore_all(pcfg, src, st, meta):
     """Make the live state equal to the snapshot. Artifacts the snapshot doesn't know about
     (added in a later aiswitch version, or enabled since) are restored as absent, so stale
     credentials of another account can't survive the switch."""
+    check_mode(pcfg, meta, f"'{Path(src).name}'")
     arts = (meta or {}).get("artifacts") or {}
     for spec in artifacts(pcfg):
         restore(spec, Path(src), arts.get(spec["name"]), st)
@@ -2458,16 +2626,26 @@ def backup_dirs(plat):
     return [p for _, p in ds]
 
 
-def prune_backups(plat, st):
-    for d in backup_dirs(plat)[:-KEEP_BACKUPS]:
+def prune_backups(plat, st, keep=None):
+    """Keep the newest KEEP_BACKUPS backups; never the one just taken (`keep`), whatever the
+    clock did (DST, time-zone travel and NTP steps can make a new name sort as oldest)."""
+    dirs = backup_dirs(plat)
+    excess = len(dirs) - KEEP_BACKUPS
+    for d in dirs:
+        if excess <= 0:
+            break
+        if keep is not None and d == Path(keep):
+            continue
         try:
             delete_snapshot(d, st)
+            excess -= 1
         except Fatal as e:
             warn(f"could not prune backup {d.name}: {e}")
+            excess -= 1
 
 
 def new_backup_dir(plat):
-    base = time.strftime("%Y%m%d-%H%M%S")
+    base = time.strftime("%Y%m%d-%H%M%S", time.gmtime())     # UTC: no DST jumps
     b, n = backup_root(plat) / base, 1
     while b.exists():
         n += 1
@@ -2490,9 +2668,16 @@ def check_processes(pcfg, do_quit):
             if not do_quit:
                 die(f"{label} is running. Quit it first, or pass --quit to let aiswitch close it.",
                     "app_running")
+            if host_os() != "darwin" and not _quit_targets(pcfg):
+                die(f"{label} appears to be running (pids {', '.join(map(str, running_pids(pcfg, pt)))}), "
+                    "but none of those processes is one aiswitch can safely ask to quit. Close it "
+                    "yourself and retry.")
             quit_app(pcfg)
             if not wait_until_quit(pcfg):
-                die(f"could not quit {label}; close it manually and retry")
+                left = running_pids(pcfg, proc_table(refresh=True))
+                die(f"could not confirm that {label} has quit"
+                    + (f" (still running: pids {', '.join(map(str, left))})" if left else "")
+                    + "; close it manually and retry")
     else:
         if names:
             warn(f"{', '.join(names)} appears to be running. Existing sessions keep the old login "
@@ -2502,7 +2687,7 @@ def check_processes(pcfg, do_quit):
                       f"{pcfg['label']} sessions after switching")
 
 
-def leave_current(plat, pcfg, st, force, do_quit, writeback=False):
+def leave_current(plat, pcfg, st, force, do_quit, writeback=False, target=None):
     """Prepare to replace the live login: stop-check, write refreshed tokens back to the
     matching saved account, and back the live state up.
     Returns (matched, synced, backup_dir)."""
@@ -2510,26 +2695,46 @@ def leave_current(plat, pcfg, st, force, do_quit, writeback=False):
     state = load_state()
     has = live_has_login(pcfg, st)
     ident = live_identity(pcfg, st)
-    matched, synced = None, False
+    active = state["active"].get(plat)
+    matched, synced, known = None, False, False
     if ident:
-        matched = find_by_identity(plat, ident)
+        hits = [n for n, m in list_accounts(plat) if m.get("identity") == ident]
+        known = bool(hits)
+        if target in hits:
+            matched = target
+        elif active in hits:
+            matched = active
+        elif len(hits) == 1:
+            matched = hits[0]
+        elif hits:
+            print(f"  the live login matches several saved accounts ({', '.join(hits)}); not syncing "
+                  "it back into any of them. It is kept in a backup.")
         synced = bool(matched)
     elif has and not pcfg.get("identity"):
         # No way to verify which account is live: the user may have signed into a different
         # account inside the app. Only write back when explicitly asked to.
-        n = state["active"].get(plat)
-        if n and (snap_dir(plat, n) / "meta.json").exists():
-            matched = n
+        if active and (snap_dir(plat, active) / "meta.json").exists():
+            matched = active
             synced = writeback
             if not writeback:
-                print(f"  not syncing the live login back into '{n}' (aiswitch can't verify which "
+                print(f"  not syncing the live login back into '{active}' (aiswitch can't verify which "
                       "account it is; pass --writeback if you're sure). It is kept in a backup.")
     if matched and synced:
         old = read_json(snap_dir(plat, matched) / "meta.json") or {}
-        take_snapshot(pcfg, snap_dir(plat, matched), st,
-                      {"created": old.get("created", old.get("saved_at")), "kind": pcfg["kind"]})
-        print(f"  synced current login back into '{matched}'")
-    elif not matched and has and not force:
+        recorded = old.get("artifacts") or {}
+        # Only sync a complete live login: identity files can outlive the credentials.
+        missing = [s["name"] for s in artifacts(pcfg) if s.get("primary")
+                   and (recorded.get(s["name"]) or {}).get("present") and not probe(s, st)]
+        if not has or missing:
+            synced = False
+            print(f"  not syncing back into '{matched}': its credentials are no longer on this machine"
+                  + (f" ({', '.join(missing)} missing)" if missing else "") + "; its saved copy is kept.")
+        else:
+            check_mode(pcfg, old, f"'{matched}'")
+            take_snapshot(pcfg, snap_dir(plat, matched), st,
+                          {"created": old.get("created", old.get("saved_at")), "kind": pcfg["kind"]})
+            print(f"  synced current login back into '{matched}'")
+    if not (matched or known) and has and not force:
         die("the login currently on this machine isn't saved under any account name.\n"
             f"  Save it first:  aiswitch save {plat} <name>\n"
             "  or pass --force to replace it (a backup is kept in ~/.aiswitch/backups).", "unsaved")
@@ -2537,7 +2742,7 @@ def leave_current(plat, pcfg, st, force, do_quit, writeback=False):
     if has:
         backup = new_backup_dir(plat)
         take_snapshot(pcfg, backup, st, {"backup": True})
-        prune_backups(plat, st)
+        prune_backups(plat, st, keep=backup)
     return matched, synced, backup
 
 
@@ -2552,7 +2757,10 @@ def apply_or_rollback(pcfg, st, backup, action):
         with signals_deferred():
             try:
                 if backup:
-                    restore_all(pcfg, backup, st, read_json(backup / "meta.json"))
+                    bmeta = read_json(Path(backup) / "meta.json")
+                    if not isinstance(bmeta, dict):
+                        raise Fatal(f"backup {backup} is missing or unreadable")
+                    restore_all(pcfg, backup, st, bmeta)
                     outcome = "previous login restored"
                 else:
                     clear_all(pcfg, st)
@@ -2631,24 +2839,29 @@ _WSL_WIN = None
 
 
 def _wsl_windows_dirs():
-    """{"wsl_local": ..., "wsl_pf64": ..., "wsl_pf86": ...} as Linux paths (WSL interop)."""
+    """{"wsl_local": ..., "wsl_pf64": ..., "wsl_pf86": ...} as Linux paths (WSL interop).
+    Failures are cached briefly (not forever), so a long-running GUI retries."""
     global _WSL_WIN
-    if _WSL_WIN is None:
-        _WSL_WIN = {}
-        cmd = shutil.which("cmd.exe") or "/mnt/c/Windows/System32/cmd.exe"
-        out = None
-        if os.path.exists(cmd):
-            with contextlib.suppress(OSError, subprocess.SubprocessError):
-                out = subprocess.run([cmd, "/c", "echo %LOCALAPPDATA%&echo %ProgramW6432%&echo %ProgramFiles(x86)%"],
-                                     capture_output=True, text=True, timeout=15, cwd="/mnt/c" if
-                                     os.path.isdir("/mnt/c") else None, stdin=subprocess.DEVNULL).stdout
-        for key, val in zip(("wsl_local", "wsl_pf64", "wsl_pf86"), (out or "").splitlines()):
-            val = val.strip()
-            if val and "%" not in val and shutil.which("wslpath"):
-                p = _run_quiet(["wslpath", "-u", val])
-                if p:
-                    _WSL_WIN[key] = p.strip()
-    return _WSL_WIN
+    if _WSL_WIN is not None and (_WSL_WIN[0] or time.monotonic() - _WSL_WIN[1] < 30):
+        return _WSL_WIN[0]
+    got = {}
+    cmd = shutil.which("cmd.exe") or "/mnt/c/Windows/System32/cmd.exe"
+    raw = b""
+    if os.path.exists(cmd):
+        with contextlib.suppress(OSError, ValueError, subprocess.SubprocessError):
+            raw = subprocess.run([cmd, "/c", "chcp 65001 >nul & echo %LOCALAPPDATA%& echo %ProgramW6432%& "
+                                  "echo %ProgramFiles(x86)%"], capture_output=True, timeout=15,
+                                 cwd="/mnt/c" if os.path.isdir("/mnt/c") else None,
+                                 stdin=subprocess.DEVNULL).stdout or b""
+    text = raw.decode("utf-8", "replace")
+    for key, val in zip(("wsl_local", "wsl_pf64", "wsl_pf86"), text.splitlines()):
+        val = val.strip()
+        if val and "%" not in val and "�" not in val and shutil.which("wslpath"):
+            p = _run_quiet(["wslpath", "-u", val])
+            if p and p.strip():
+                got[key] = p.strip()
+    _WSL_WIN = (got, time.monotonic())
+    return got
 
 
 def _app_path(exe):
@@ -2677,64 +2890,119 @@ def _btpl(tpl, wsl):
     return expand(tpl)
 
 
+@contextlib.contextmanager
+def mock_env(key, value):
+    """Temporarily set an environment variable."""
+    old = os.environ.get(key)
+    os.environ[key] = value
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = old
+
+
+def _which_safe(name):
+    """shutil.which, but on Windows never from the current directory or relative PATH entries."""
+    if os.name != "nt":
+        return shutil.which(name)
+    path = os.pathsep.join(d for d in os.environ.get("PATH", "").split(os.pathsep) if d and os.path.isabs(d))
+    with mock_env("NoDefaultCurrentDirectoryInExePath", "1"):
+        hit = shutil.which(name, path=path)
+    return hit if hit and os.path.isabs(hit) else None
+
+
 def _find_launcher(var):
     if var.get("flatpak"):
-        fp = shutil.which("flatpak")
+        fp = _which_safe("flatpak")
         return [fp, "run", var["flatpak"]] if fp else None
     for cand in var.get("bin", []):
         if cand.startswith("apppath:"):
             hit = _app_path(cand[8:])
             if hit:
                 return [hit]
-        elif "/" in cand or "{" in cand:
+        elif "/" in cand or "\\" in cand or "{" in cand:
             p = _btpl(cand, var.get("wsl"))
             if p and p.is_file():
                 return [str(p)]
-        elif shutil.which(cand):
-            return [shutil.which(cand)]
+        elif _which_safe(cand):
+            return [_which_safe(cand)]
     return None
 
 
 def _mac_launcher(app):
+    """`open -na <app>`: <app> is a name LaunchServices knows, or a path to a .app bundle."""
+    if app.endswith(".app") or "/" in app:
+        p = expand(app)
+        return ["open", "-na", str(p), "--args"] if p and p.is_dir() else None
     for base in ("/Applications", str(home() / "Applications")):
         if os.path.isdir(f"{base}/{app}.app"):
             return ["open", "-na", app, "--args"]
+    if host_os() == "darwin" and sys.platform == "darwin":
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            if subprocess.run(["open", "-Ra", app], capture_output=True, timeout=10).returncode == 0:
+                return ["open", "-na", app, "--args"]
     return None
 
 
 def browser_variants(pcfg):
+    """Candidate (browser, data dir) pairs for this platform, best first.
+    "browser": auto | chrome | edge | chromium | brave | a legacy macOS app name ("Google
+    Chrome"...) | any other app name (custom browser: needs "user_data", plus "browser_bin" off
+    macOS). "user_data" / "browser_bin" refine a preset instead of replacing it."""
     me = host_os()
     sel = pcfg.get("browser") or "auto"
-    if pcfg.get("user_data") or pcfg.get("browser_bin") or (sel not in BROWSERS and sel != "auto"):
-        # custom browser (platforms.json): user_data + browser_bin, "browser" = macOS app name
-        data = expand(pcfg["user_data"]) if pcfg.get("user_data") else None
-        bins = pcfg.get("browser_bin")
-        bins = bins.get(me) if isinstance(bins, dict) else bins
-        bins = [bins] if isinstance(bins, str) else list(bins or [])
-        name = sel if sel not in BROWSERS and sel != "auto" else "browser"
-        launcher = _mac_launcher(name) if me == "darwin" else _find_launcher({"bin": bins})
-        return [Browser("custom", name, launcher, data, bool(pcfg.get("user_data")), me == "darwin")]
+    known = {}
+    for k, b in BROWSERS.items():
+        known[b["mac_app"].lower()] = known[b["label"].lower()] = known[k] = k
+    preset = "auto" if sel == "auto" else known.get(str(sel).lower())
+    ud = pcfg.get("user_data")
+    data_over = expand(ud) if ud else None
+    bins = pcfg.get("browser_bin")
+    bins = bins.get(me) if isinstance(bins, dict) else bins
+    bins = [bins] if isinstance(bins, str) else list(bins or [])
+
+    def custom_launcher(mac_app):
+        if me == "darwin":
+            return _mac_launcher(bins[0]) if bins else _mac_launcher(mac_app)
+        return _find_launcher({"bin": bins})
+
+    if preset is None:
+        if data_over is None:
+            die(f"platforms.json: browser '{sel}' is not one of auto, {', '.join(BROWSERS)}; a custom "
+                "browser needs \"user_data\" (its profile directory) and, outside macOS, \"browser_bin\"")
+        return [Browser("custom", str(sel), custom_launcher(str(sel)), data_over, True, me == "darwin")]
     out = []
-    for preset in (AUTO_BROWSERS if sel == "auto" else (sel,)):
-        b = BROWSERS[preset]
+    for name in (AUTO_BROWSERS if preset == "auto" else (preset,)):
+        b = BROWSERS[name]
         for var in b.get(me, []):
             if var.get("wsl") and not is_wsl():
                 continue
-            data = _btpl(var["data"], var.get("wsl"))
-            if me == "darwin":
-                out.append(Browser(preset, b["label"], _mac_launcher(b["mac_app"]), data, False, True))
+            data = data_over or _btpl(var["data"], var.get("wsl"))
+            if bins:
+                launcher = custom_launcher(b["mac_app"])
+            elif me == "darwin":
+                launcher = _mac_launcher(b["mac_app"])
             else:
-                out.append(Browser(preset, b["label"], _find_launcher(var), data, False, False))
+                launcher = _find_launcher(var)
+            out.append(Browser(name, b["label"], launcher, data, bool(data_over), me == "darwin"))
     return out
 
 
 def select_browser(pcfg, prefer=None):
-    """The browser to list profiles from and launch. `prefer` = a saved account's meta."""
+    """The browser to list profiles from and launch. `prefer` = a saved account's meta: then
+    exactly the browser + data dir it was saved with, or an error (never another browser,
+    whose profile of the same directory name may belong to someone else)."""
     vs = browser_variants(pcfg)
     if prefer and prefer.get("browser"):
         for v in vs:
             if v.preset == prefer["browser"] and str(v.data) == prefer.get("user_data"):
                 return v
+        die(f"this account was saved with {prefer.get('browser_label') or prefer['browser']} "
+            f"(profile data in {prefer.get('user_data')}), which isn't available with the current "
+            "settings. Restore that browser / setting, or save the account again.", "browser")
     has_state = [v for v in vs if v.data and (v.data / "Local State").is_file()]
     for pool in ([v for v in has_state if v.launcher], has_state, [v for v in vs if v.launcher], vs):
         if pool:
@@ -2774,14 +3042,22 @@ def open_browser_profile(b, profile, url):
         name = b.label if b else "a Chromium-based browser"
         return (f"could not find {name}; install it, or set \"browser\" (chrome, edge, chromium, "
                 "brave) or \"browser_bin\" for this platform in platforms.json")
+    if b.data and chrome_profiles(b) and profile not in chrome_profiles(b) and not (b.data / profile).is_dir():
+        return f"profile directory '{profile}' no longer exists in {b.data}"
     args = [f"--profile-directory={profile}"]
+    win_exe = (not b.mac) and b.launcher[0].lower().endswith(".exe")
     if b.pass_user_data and b.data:
-        args.append(f"--user-data-dir={b.data}")
+        ud = str(b.data)
+        if win_exe and is_wsl():                     # a Windows browser needs a Windows path
+            conv = _run_quiet(["wslpath", "-w", ud]) if shutil.which("wslpath") else None
+            if not conv or not conv.strip():
+                return f"cannot convert {ud} to a Windows path (wslpath failed)"
+            ud = conv.strip()
+        args.append(f"--user-data-dir={ud}")
     try:
         if b.mac:
             r = subprocess.run(b.launcher + args + [url], capture_output=True, text=True)
             return None if r.returncode == 0 else (r.stderr.strip() or f"open exited {r.returncode}")
-        win_exe = b.launcher[0].lower().endswith(".exe")
         if host_os() == "linux" and not win_exe and not (os.environ.get("DISPLAY") or
                                                          os.environ.get("WAYLAND_DISPLAY")):
             return "no graphical session (DISPLAY / WAYLAND_DISPLAY are not set)"
@@ -2931,6 +3207,9 @@ def cmd_save(args):
             if not args.profile:
                 profs = ", ".join(chrome_profiles(b).values()) if b else ""
                 die(f"pass --profile <browser profile name>. Profiles: {profs or '(none found)'}")
+            if b.data is None:
+                die(f"don't know where {b.label} keeps its profiles here; set \"user_data\" for this "
+                    "platform in platforms.json")
             pdir, pname = resolve_profile(b, args.profile)
             write_meta_dir(dest, {"schema": SNAPSHOT_SCHEMA, "kind": "browser", "profile": pdir,
                                   "profile_name": pname, "browser": b.preset, "browser_label": b.label,
@@ -2981,8 +3260,9 @@ def cmd_use(args):
             return
         cleanup_trash(plat, st, pcfg)
         preflight(pcfg)
+        check_mode(pcfg, meta, f"'{name}'")
         matched, synced, backup = leave_current(plat, pcfg, st, args.force, args.quit,
-                                                getattr(args, "writeback", False))
+                                                getattr(args, "writeback", False), target=name)
         if matched == name and synced:
             print(f"'{name}' is already the active {pcfg['label']} account")
         else:
@@ -3228,7 +3508,7 @@ function card(p){
     $("button",{class:"d",title:"Delete saved account",onclick:async()=>{if(await confirmDlg(`Delete saved account "${a.name}" (${p.label})? This can't be undone.`,"Delete"))act({op:"rm",platform:p.id,name:a.name})}},"✕")))
     :[$("div",{class:"empty"},"No saved accounts yet.")];
   const hint=p.kind==="login"?$("div",{class:"hint"},"To add another account: “Add new account”, then "+p.login_hint+", then “Save current login”."):null;
-  return $("section",{class:"card"},$("div",{class:"ch"},$("h2",{},p.label),p.running?$("span",{class:"tag run"},"running"):null,$("div",{class:"sp"}),$("span",{class:"tag"},p.id)),list,hint,foot)}
+  return $("section",{class:"card"},$("div",{class:"ch"},$("h2",{},p.label),p.running?$("span",{class:"tag run"},"running"):(p.running===null?$("span",{class:"tag",title:"aiswitch cannot see all processes here"},"running?"):null),$("div",{class:"sp"}),$("span",{class:"tag"},p.id)),list,hint,foot)}
 async function load(){const r=await api("/api/state");const m=document.getElementById("main");m.textContent="";
   if(!r.ok){m.append($("div",{class:"empty"},r.error||"Cannot reach aiswitch. Re-open it with `aiswitch gui`."));return}
   r.platforms.forEach(p=>m.append(card(p)))}
@@ -3248,10 +3528,13 @@ def gui_state():
             accounts.append({"name": name, "detail": detail.replace("|", " · "), "saved_at": meta.get("saved_at")})
         cur, _ = current_account(k, v, state)
         b = select_browser(v) if v["kind"] == "browser" else None
+        running = False
+        if v["kind"] != "browser":
+            names, unknown = running_state(v, pt)
+            running = True if names else (None if unknown else False)
         out.append({
             "id": k, "label": v["label"], "kind": v["kind"], "accounts": accounts, "current": cur,
-            "login_hint": v.get("login_hint", ""),
-            "running": bool(running_state(v, pt)[0]) if v["kind"] != "browser" else False,
+            "login_hint": v.get("login_hint", ""), "running": running,
             "profiles": ([{"dir": d, "name": n} for d, n in chrome_profiles(b).items()] if b else []),
         })
     return out
