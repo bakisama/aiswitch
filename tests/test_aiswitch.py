@@ -1376,14 +1376,21 @@ class TestReviewRegressions(Env):
         self.codex_login("a@x.com", "A1", "v1-work2")
         self.run_cli("save", "codex", "work2", "--allow-duplicate")
         refreshed = self.codex_login("a@x.com", "A1", "v2-work2").read_bytes()
-        st = A.load_state()
-        st["active"]["codex"] = "work"          # stale state must not win over the requested target
-        A.save_state(st)
-        _, out, _ = self.run_cli("use", "codex", "work2")
+        _, out, _ = self.run_cli("use", "codex", "work2")          # work2 is active and live
         self.assertIn("already the active", out)
         self.assertEqual(self.read(".codex/auth.json"), refreshed)
         self.assertIn(b"v1-work", (A.snap_dir("codex", "work") / "auth").read_bytes())
         self.assertNotIn(b"v2", (A.snap_dir("codex", "work") / "auth").read_bytes())
+        _, out, _ = self.run_cli("use", "codex", "work")           # live is work2: sync there, then switch
+        self.assertIn("synced current login back into 'work2'", out)
+        self.assertIn(b"v1-work\"", self.read(".codex/auth.json") + b'"')
+        self.assertIn(b"v2-work2", (A.snap_dir("codex", "work2") / "auth").read_bytes())
+        st = A.load_state()
+        st["active"].pop("codex")                                  # unknown which duplicate is live
+        A.save_state(st)
+        _, out, _ = self.run_cli("use", "codex", "work2")
+        self.assertIn("matches several saved accounts", out)
+        self.assertIn(b"v1-work", (A.snap_dir("codex", "work") / "auth").read_bytes())
 
     def test_PROC2_unknown_during_quit_wait_is_not_quit(self):
         os.environ["AISWITCH_FORCE_OS"] = "linux"
@@ -1395,7 +1402,7 @@ class TestReviewRegressions(Env):
 
     def test_PROC3_bare_image_name_is_ambiguous(self):
         os.environ["AISWITCH_FORCE_OS"] = "windows"
-        pt = A.ProcTable([P(4242, "claude.exe", ["claude.exe"])], partial=True)
+        pt = A.ProcTable([P(4242, "claude.exe", ["claude.exe"])], partial=True, pathless=True)
         self.assertEqual(A.running_state(A.load_platforms()["claude-code"], pt), ([], True))
 
     def test_PROC4_unquittable_match_names_the_pids(self):
@@ -1497,8 +1504,10 @@ class TestBrowserReview(Env):
         self.cfg({"browser": "chrome", "browser_bin": str(exe)})
         b = A.select_browser(A.load_platforms()["claude-web"])
         self.assertEqual((b.launcher, b.data), ([str(exe)], self.home / ".config/google-chrome"))
-        self.cfg({"browser_bin": str(exe)})
-        self.assertEqual(A.select_browser(A.load_platforms()["claude-web"]).launcher, [str(exe)])
+        self.assertTrue(b.pass_user_data)                       # the custom binary gets the listed dir
+        self.cfg({"browser_bin": str(exe)})                      # auto + browser_bin: ambiguous data dir
+        with self.assertRaises(A.Fatal):
+            A.select_browser(A.load_platforms()["claude-web"])
 
     @unittest.skipUnless(POSIX, "sh scripts")
     def test_BR5_wsl_windows_browser_gets_windows_path(self):
@@ -1518,3 +1527,43 @@ class TestBrowserReview(Env):
         self.fake_bin("cmd.exe", "#!/bin/sh\nprintf 'C:\\\\Users\\\\Jos\\202\\\\AppData\\\\Local\\r\\n'\n")
         A._WSL_WIN = None
         self.assertEqual(A._wsl_windows_dirs(), {})
+
+
+class TestVerifyRegressions(Env):
+    def test_bsd_bare_names_still_detected(self):
+        pt = A.ProcTable([P(9, "claude", ["claude"])])            # BSD ps: short comm, argv0 via PATH
+        self.assertEqual(A.running_state(A.load_platforms()["claude-code"], pt), (["claude"], False))
+
+    def test_quit_wait_finishes_in_partial_table(self):
+        plat = {"kind": "app", "label": "X", "processes": ["xapp"]}
+        seq = iter([[P(5, "/usr/bin/xapp", ["xapp"])]] + [[]] * 100)
+        A.PROC_PROVIDER = lambda: next(seq)
+        with mock.patch.object(A, "sandbox_kind", lambda: "flatpak"):
+            A.proc_table(refresh=True)
+            self.assertTrue(A.wait_until_quit(plat, timeout=2))
+
+    def test_browser_bin_with_auto_is_refused(self):
+        self.store().mkdir()
+        (self.store() / "platforms.json").write_text(json.dumps({"schema": 1, "platforms": {
+            "claude-web": {"browser_bin": "/opt/x/chrome"}}}))
+        _, _, err = self.run_cli("profiles", "claude-web", ok=False)
+        self.assertIn("browser_bin", err)
+
+    def test_legacy_custom_meta_still_opens(self):
+        self.write(".config/google-chrome/Local State", json.dumps({"profile": {"info_cache": {"P": {"name": "P"}}}}))
+        b = A.select_browser(A.load_platforms()["claude-web"],
+                             prefer={"browser": "custom", "user_data": str(self.home / ".config/google-chrome")})
+        self.assertEqual(b.preset, "chrome")
+
+
+@unittest.skipUnless(POSIX, "fake security is a posix script")
+class TestMacKeychainNoDump(FakeSecurity, unittest.TestCase):
+    def test_stale_items_without_dump_are_warned(self):
+        p = Path(os.environ["FAKE_SEC_DB"])
+        p.write_text(json.dumps([{"svc": "S", "acct": "alice", "pw": "6f"}, {"svc": "S", "acct": "bob", "pw": "62"}]))
+        s = A.MacKeychain()
+        A._WARNED.clear()
+        err = io.StringIO()
+        with mock.patch.object(A.MacKeychain, "accounts", lambda self, svc: None), contextlib.redirect_stderr(err):
+            s.replace("S", "alice", "new")
+        self.assertIn("may remain", err.getvalue())

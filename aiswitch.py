@@ -909,11 +909,12 @@ def _procs_windows():
 
 
 class ProcTable:
-    def __init__(self, procs, partial=False):
+    def __init__(self, procs, partial=False, pathless=False):
         self.procs = None if procs is None else [p if isinstance(p, Proc) else
                                                  Proc(p[0], p[1], list(p[2]), " ".join(p[2]))
                                                  for p in procs]
         self.partial = partial         # True: processes outside our view exist (sandbox, no cmdlines)
+        self.pathless = pathless       # True: entries may be bare image names (Windows tasklist fallback)
 
     @staticmethod
     def _has_path(p):
@@ -933,7 +934,7 @@ class ProcTable:
                 script = next((a for a in p.argv[1:] if not a.startswith("-")), "")
                 if script and _norm(_base(script)) in {_norm(n) for n in names}:
                     hit = "strong"
-        if hit and exclude and not self._has_path(p):
+        if hit and exclude and self.pathless and not self._has_path(p):
             # e.g. a bare "claude.exe" image name: the desktop-app path excludes can't be checked
             return "ambiguous"
         if hit:
@@ -984,7 +985,7 @@ def proc_table(refresh=False, max_age=None):
             procs = _procs_ps()
         else:
             procs = None
-        _PROC_CACHE = ProcTable(procs, partial)
+        _PROC_CACHE = ProcTable(procs, partial, pathless=partial and host_os() == "windows")
         _PROC_TIME = time.monotonic()
     return _PROC_CACHE
 
@@ -1072,8 +1073,10 @@ def wait_until_quit(pcfg, timeout=15.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         time.sleep(0.5)
-        names, unknown = running_state(pcfg, proc_table(refresh=True))
-        if not names and not unknown:
+        hits = proc_table(refresh=True).find(**proc_spec(pcfg))
+        # Gone = a working scan with no match at all (a partial view still saw the app before,
+        # so no match now means it exited); a failed scan or an ambiguous match is not "gone".
+        if hits is not None and not hits:
             return True
     return False
 
@@ -1493,6 +1496,8 @@ class MacKeychain(SecretStore):
                 if a is None or a == mine:
                     break
                 self.delete(service, a)
+            warn_once("kc-enum", f"could not list keychain items (security dump-keychain failed); other "
+                      f"accounts' items of '{service}' may remain")
             return
         for a in others:                                     # ... delete the other accounts after
             if a != mine:
@@ -1688,7 +1693,12 @@ class SecretServiceStore(SecretStore):
             self._clear(service, prior)
         self._store(service, attrs, label, secret)
         if prior is not None and not early:
-            self._clear(service, prior)
+            try:
+                self._clear(service, prior)
+            except Fatal:
+                with contextlib.suppress(Fatal):  # put things back as they were: only the prior item
+                    self._clear(service, attrs)
+                raise
 
     def delete(self, service, account=None):
         got = self._find(service, account)
@@ -2700,9 +2710,7 @@ def leave_current(plat, pcfg, st, force, do_quit, writeback=False, target=None):
     if ident:
         hits = [n for n, m in list_accounts(plat) if m.get("identity") == ident]
         known = bool(hits)
-        if target in hits:
-            matched = target
-        elif active in hits:
+        if active in hits:                  # the account last switched to is the live one
             matched = active
         elif len(hits) == 1:
             matched = hits[0]
@@ -2969,6 +2977,9 @@ def browser_variants(pcfg):
             return _mac_launcher(bins[0]) if bins else _mac_launcher(mac_app)
         return _find_launcher({"bin": bins})
 
+    if bins and preset == "auto" and data_over is None:
+        die("platforms.json: \"browser_bin\" needs \"browser\" (chrome, edge, chromium, brave) or "
+            "\"user_data\", so aiswitch knows which profile directory that binary uses")
     if preset is None:
         if data_over is None:
             die(f"platforms.json: browser '{sel}' is not one of auto, {', '.join(BROWSERS)}; a custom "
@@ -2987,7 +2998,8 @@ def browser_variants(pcfg):
                 launcher = _mac_launcher(b["mac_app"])
             else:
                 launcher = _find_launcher(var)
-            out.append(Browser(name, b["label"], launcher, data, bool(data_over), me == "darwin"))
+            # a custom binary is told explicitly which profile directory we listed
+            out.append(Browser(name, b["label"], launcher, data, bool(data_over or bins), me == "darwin"))
     return out
 
 
@@ -2998,7 +3010,8 @@ def select_browser(pcfg, prefer=None):
     vs = browser_variants(pcfg)
     if prefer and prefer.get("browser"):
         for v in vs:
-            if v.preset == prefer["browser"] and str(v.data) == prefer.get("user_data"):
+            if (v.preset == prefer["browser"] or prefer["browser"] == "custom") and \
+                    str(v.data) == prefer.get("user_data"):
                 return v
         die(f"this account was saved with {prefer.get('browser_label') or prefer['browser']} "
             f"(profile data in {prefer.get('user_data')}), which isn't available with the current "
