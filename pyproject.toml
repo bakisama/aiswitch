@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aiswitch"
+dynamic = ["version"]
+description = "Switch between saved logins of AI coding tools (Claude Code, Codex CLI, Gemini CLI) without re-authenticating."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Divyansh Sevta" }]
+keywords = ["claude-code", "codex", "gemini-cli", "account-switcher", "cli"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Utilities",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/bakisama/aiswitch"
+Issues = "https://github.com/bakisama/aiswitch/issues"
+
+[project.scripts]
+aiswitch = "aiswitch:main"
+
+[tool.setuptools]
+py-modules = ["aiswitch"]
+
+[tool.setuptools.dynamic]
+version = { attr = "aiswitch.VERSION" }
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E501"]

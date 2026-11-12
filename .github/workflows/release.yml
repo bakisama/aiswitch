@@ -1,0 +1,81 @@
+name: release
+
+# Push a tag vX.Y.Z (must equal aiswitch.VERSION).
+#   vX.Y.ZrcN  -> TestPyPI only (dry run of the whole pipeline)
+#   vX.Y.Z     -> PyPI + GitHub Release with aiswitch.pyz and SHA256SUMS
+# PyPI uses Trusted Publishing (no API token): register this repo + workflow + environment
+# on pypi.org / test.pypi.org first, and protect the "pypi" environment with a required reviewer.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: tag must match VERSION
+        run: |
+          v=$(python -c "import aiswitch; print(aiswitch.VERSION)")
+          test "v$v" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != VERSION $v"; exit 1; }
+      - run: python -m unittest discover -s tests
+      - run: pip install build && python -m build
+      - run: python tools/build_pyz.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  testpypi:
+    if: contains(github.ref_name, 'rc')
+    needs: build
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - run: rm -f dist/aiswitch.pyz dist/SHA256SUMS
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  pypi:
+    if: ${{ !contains(github.ref_name, 'rc') }}
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - run: rm -f dist/aiswitch.pyz dist/SHA256SUMS
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    needs: pypi
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes \
+            dist/aiswitch.pyz dist/SHA256SUMS dist/*.whl dist/*.tar.gz
