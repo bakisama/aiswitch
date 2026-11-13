@@ -7,3 +7,6 @@ snapshots/
 backups/
 state.json
 *.log
+dist/
+build/
+*.egg-info/
