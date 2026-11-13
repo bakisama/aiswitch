@@ -31,6 +31,11 @@ jobs:
         exclude:
           - os: windows-11-arm          # setup-python has native ARM64 Windows builds from 3.11
             python: "3.9"
+          - os: ubuntu-latest           # Ubuntu 26.04 images have no Python 3.9 (EOL); test it on 24.04
+            python: "3.9"
+        include:
+          - os: ubuntu-24.04
+            python: "3.9"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

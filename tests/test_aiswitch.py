@@ -876,7 +876,7 @@ class TestDesktopApp(Env):
         pt = A.proc_table(True)
         self.assertEqual(A.running_state(A.load_platforms()["claude-code"], pt), ([], False))
         self.assertTrue(A.running_state(A.load_platforms()["claude-desktop"], pt)[0])
-        with mock.patch.object(A.os, "getpgid", lambda pid: -1):
+        with mock.patch.object(A.os, "getpgid", lambda pid: -1, create=True):
             self.assertEqual(A._quit_targets(A.load_platforms()["claude-desktop"]), [2])
 
     def test_no_writeback_without_flag(self):
@@ -969,8 +969,9 @@ class TestProcesses(Env):
         self.assertIn("cannot detect", err)
 
     def test_launch_argv_keeps_urls_and_flags(self):
-        self.assertEqual(A._launch_argv(["~/bin/app", "https://claude.ai/x", "--a=b//c", "{home}/f"]),
-                         [str(self.home / "bin/app"), "https://claude.ai/x", "--a=b//c", str(self.home / "f")])
+        argv = A._launch_argv(["~/bin/app", "https://claude.ai/x", "--a=b//c", "{home}/f"])
+        self.assertEqual([Path(argv[0]), argv[1], argv[2], Path(argv[3])],
+                         [self.home / "bin/app", "https://claude.ai/x", "--a=b//c", self.home / "f"])
         self.assertEqual(A._launch_argv("flatpak run com.anthropic.Claude"),
                          ["flatpak", "run", "com.anthropic.Claude"])
 
@@ -987,7 +988,9 @@ class TestProcesses(Env):
             p.kill()
             p.wait()
 
-    @unittest.skipUnless(POSIX and shutil.which("ps"), "needs ps")
+    @unittest.skipUnless(POSIX and shutil.which("ps") and
+                         "busybox" not in os.path.realpath(shutil.which("ps") or ""),
+                         "needs a procps/BSD ps (busybox ps has no uid column; Linux reads /proc)")
     def test_ps_backend_ignores_columns(self):
         p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "x" * 300 + "-tail-marker"])
         try:
@@ -1025,6 +1028,7 @@ class TestBrowsers(Env):
         time.sleep(0.3)
         self.assertIn("--profile-directory=Profile 1 https://claude.ai", log.read_text())
 
+    @unittest.skipUnless(POSIX, "uses a sh script as a fake browser")
     def test_headless_launch_is_an_error(self):
         self.fake_bin("google-chrome")
         self.local_state(".config/google-chrome", {"Default": "Me"})
@@ -1091,7 +1095,8 @@ class TestConfig(Env):
             self.cfg({"schema": 1, "platforms": {"evil": {"kind": "login", "label": "e", "artifacts": [
                 {"name": "d", "type": "dir", "path": path, "primary": True}]}}})
             _, _, err = self.run_cli("save", "evil", "x", ok=False)
-            self.assertIn("refusing to manage", err, path)
+            self.assertTrue("refusing to manage" in err or (os.name == "nt" and "must be absolute" in err),
+                            f"{path}: {err}")
 
     def test_bad_names(self):
         for plats in ({"evil": {"kind": "login", "artifacts": [{"name": "../x", "type": "file", "path": "~/a"}]}},
