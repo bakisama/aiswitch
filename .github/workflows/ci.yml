@@ -77,7 +77,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: python -m unittest discover -s tests -v
+      # the container runs as root with HOME owned by the runner user: aiswitch's sudo guard
+      # (correctly) refuses that, so opt in explicitly for this smoke run
       - run: python aiswitch.py doctor
+        env:
+          AISWITCH_ALLOW_ROOT: "1"
 
   freebsd:
     runs-on: ubuntu-latest
