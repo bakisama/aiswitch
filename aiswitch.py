@@ -1583,10 +1583,9 @@ class SecretServiceStore(SecretStore):
         n = len(re.findall(r"^\[/[^\]\n]*\]$", out, re.M))
         if n != 1:
             return n, None
-        got = dict(re.findall(r"^attribute\.(.+?) = (.*)$", err, re.M))
-        schema = re.search(r"^schema = (.*)$", out, re.M)
-        if schema:
-            got.setdefault("xdg:schema", schema.group(1))
+        # xdg:schema is deliberately not tracked: `search` prints it inconsistently (it can be
+        # missing from one call to the next), and `secret-tool store` always sets it itself.
+        got = {k: v for k, v in re.findall(r"^attribute\.(.+?) = (.*)$", err, re.M) if k != "xdg:schema"}
         label = re.search(r"^label = (.*)$", out, re.M)
         if not all(got.get(k) == str(v) for k, v in attrs.items()):
             self._fail("search", attrs.get("service", "?"), "could not parse `secret-tool search` output")
@@ -1646,7 +1645,8 @@ class SecretServiceStore(SecretStore):
                 attrs[self.META_ATTR] = json.dumps(meta, separators=(",", ":"), sort_keys=True)
             return attrs, f"aiswitch saved copy ({service})"
         m = meta if isinstance(meta, dict) and meta.get("kind") == self.name else {}
-        attrs, label = dict(m.get("attrs") or {}), m.get("label")
+        attrs = {k: v for k, v in (m.get("attrs") or {}).items() if k != "xdg:schema"}
+        label = m.get("label")
         if not attrs:
             prior = self._find(service, account)
             if prior:
@@ -1686,19 +1686,34 @@ class SecretServiceStore(SecretStore):
         attrs, label = self._target(service, account, meta)
         prior = self._find(service, None if exclusive else account)
         prior = prior[0] if prior and prior[0] != attrs else None
-        # `clear` deletes every item whose attributes include the given ones: an old item whose
-        # attributes are a subset of the new item's must be cleared before storing the new one.
-        early = prior is not None and prior.items() <= attrs.items()
+        # When one attribute set contains the other, the two operations overlap: `clear prior`
+        # would also delete the new item (prior <= attrs), and `store attrs` replaces the old
+        # item in place (attrs <= prior), which a later `clear prior` would then delete. In both
+        # cases the old item goes first; its secret is kept to put it back if the store fails.
+        early = prior is not None and (prior.items() <= attrs.items() or attrs.items() <= prior.items())
         if early:
+            r = self._run(["lookup", *self._pairs(prior)])
+            old = r.stdout if r.returncode == 0 else None
             self._clear(service, prior)
-        self._store(service, attrs, label, secret)
-        if prior is not None and not early:
             try:
-                self._clear(service, prior)
-            except Fatal:
-                with contextlib.suppress(Fatal):  # put things back as they were: only the prior item
-                    self._clear(service, attrs)
+                self._store(service, attrs, label, secret)
+            except BaseException:
+                if old is not None:
+                    with contextlib.suppress(Fatal):
+                        self._run(["store", f"--label={label}", *self._pairs(prior)], stdin=old)
                 raise
+        else:
+            self._store(service, attrs, label, secret)
+            if prior is not None:
+                try:
+                    self._clear(service, prior)
+                except Fatal:
+                    with contextlib.suppress(Fatal):  # back to how it was: only the prior item
+                        self._clear(service, attrs)
+                    raise
+        chk = self._run(["lookup", *self._pairs(attrs)])                 # the outcome, not the steps
+        if chk.returncode != 0 or chk.stdout != secret.encode("utf-8"):
+            die(f"secret service item '{service}' is not in place after the switch", "keychain")
 
     def delete(self, service, account=None):
         got = self._find(service, account)

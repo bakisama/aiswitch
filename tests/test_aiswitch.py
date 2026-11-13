@@ -432,6 +432,26 @@ class TestSecretServiceReal(StoreContract, unittest.TestCase):
         self.assertNotIn(b"username", r.stderr)
         self.assertEqual(self.s.read(self.svc)["secret"], "s2")
 
+    def test_replace_when_search_reports_xdg_schema_inconsistently(self):
+        # Seen on CI: `secret-tool search` sometimes prints the item's schema and sometimes not.
+        # When the old item looked like {service, account, xdg:schema} and the new one like
+        # {service, account}, `store` replaced the old item in place (secret-tool adds xdg:schema
+        # itself) and clearing the old attributes then deleted the freshly written login.
+        subprocess.run(["secret-tool", "store", "--label=t", "service", self.svc, "account", "a1"],
+                       input=b"old", check=True)
+        real_find = self.s._find
+
+        def flaky_find(service, account):
+            got = real_find(service, account)
+            if got:
+                got = ({**got[0], "xdg:schema": "org.freedesktop.Secret.Generic"}, got[1])
+            return got
+        meta = {"kind": A.SecretServiceStore.name, "attrs": {"service": self.svc, "account": "a1"}, "label": "t"}
+        with mock.patch.object(self.s, "_find", flaky_find):
+            self.s.replace(self.svc, "a1", "new", meta, exclusive=False)
+        r = subprocess.run(["secret-tool", "lookup", "service", self.svc, "account", "a1"], capture_output=True)
+        self.assertEqual(r.stdout, b"new")
+
     def test_vault_keeps_meta(self):
         v = A.SecretServiceStore(vault=True)
         meta = {"kind": "secret-service", "attrs": {"service": "x", "account": "y"}, "label": "L"}
