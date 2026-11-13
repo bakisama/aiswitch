@@ -1,5 +1,7 @@
 # aiswitch
 
+**Website:** [bakisama.github.io/aiswitch](https://bakisama.github.io/aiswitch/)
+
 Account switcher for AI coding tools, in the spirit of TcNo Account Switcher. It saves each
 account's login state and swaps a saved copy back in, so you can move between your own
 accounts without logging in again. It never asks for or stores your password. It only copies
